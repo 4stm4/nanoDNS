@@ -1,8 +1,9 @@
 [package]
 name = "nanodns"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Минимальный DNS-сервер для локальной Wi-Fi сети TinyWifi"
+license = "AGPL-3.0"
+description = "Minimal dependency-free DNS server for small local networks"
 
 [[bin]]
 name = "nanodns"

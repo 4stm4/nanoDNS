@@ -157,7 +157,11 @@ pub fn parse_query(buf: &[u8]) -> Result<Query, DnsError> {
     ]);
     Ok(Query {
         header,
-        question: Question { name, qtype, qclass },
+        question: Question {
+            name,
+            qtype,
+            qclass,
+        },
     })
 }
 

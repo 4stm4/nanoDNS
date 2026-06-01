@@ -74,7 +74,11 @@ impl Config {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
-                eprintln!("config: строка {}: нет '=', пропускаю: {}", lineno + 1, line);
+                eprintln!(
+                    "config: строка {}: нет '=', пропускаю: {}",
+                    lineno + 1,
+                    line
+                );
                 continue;
             };
             let key = key.trim();
@@ -185,7 +189,10 @@ record=router.lan,A,192.168.4.1,60
         assert_eq!(cfg.domain, "lan");
         assert_eq!(cfg.router_fqdn(), "router.lan");
         assert_eq!(cfg.upstream, vec!["1.1.1.1:53", "8.8.8.8:53"]);
-        assert_eq!(cfg.lease_file.as_deref(), Some("/var/lib/nanodhcp/leases.txt"));
+        assert_eq!(
+            cfg.lease_file.as_deref(),
+            Some("/var/lib/nanodhcp/leases.txt")
+        );
         assert!(cfg.cache);
         assert!(!cfg.captive);
         assert_eq!(cfg.records.len(), 2);

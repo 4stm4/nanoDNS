@@ -202,7 +202,8 @@ mod tests {
     #[test]
     fn resolve_lease_hostname() {
         let mut r = Resolver::new(base_config());
-        r.leases.insert("phone".to_string(), Ipv4Addr::new(192, 168, 4, 23));
+        r.leases
+            .insert("phone".to_string(), Ipv4Addr::new(192, 168, 4, 23));
         let resp = r.resolve(&query("phone.lan", TYPE_A), &[]);
         assert_eq!(answer_ip(&resp), Ipv4Addr::new(192, 168, 4, 23));
     }
