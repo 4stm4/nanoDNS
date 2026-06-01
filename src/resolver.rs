@@ -10,31 +10,83 @@
 //!   7. SERVFAIL / NXDOMAIN
 //!
 //! Resolver сознательно отделён от парсинга пакетов (модуль `dns`).
+//!
+//! Все методы берут `&self` (внутренняя изменяемость через `Mutex`), чтобы
+//! резолвер можно было шарить между потоками в `Arc`. Форвард на upstream
+//! выполняется БЕЗ удержания блокировок, чтобы медленный upstream не блокировал
+//! локальный резолвинг других запросов.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::dns::{self, Query};
 use crate::forward;
+use crate::leases::{self, Lease};
+
+/// Как часто разрешено проверять mtime lease-файла (не чаще, чем раз в N).
+const LEASE_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Хранилище leases с метаданными для перезагрузки по mtime.
+struct LeaseStore {
+    path: Option<String>,
+    table: HashMap<String, Lease>,
+    last_reload: Instant,
+    last_mtime: Option<SystemTime>,
+}
+
+impl LeaseStore {
+    /// Перечитать leases, если прошёл интервал и mtime файла изменился.
+    fn maybe_reload(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.last_reload.elapsed() < LEASE_RELOAD_INTERVAL {
+            return;
+        }
+        self.last_reload = Instant::now();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime != self.last_mtime {
+            println!("leases: файл изменился, перезагружаю {}", path);
+            self.table = leases::load(&path);
+            self.last_mtime = mtime;
+        }
+    }
+}
 
 /// Состояние резолвера: конфиг, leases и кэш.
 pub struct Resolver {
     config: Config,
-    leases: HashMap<String, Ipv4Addr>,
-    cache: Cache,
+    leases: Mutex<LeaseStore>,
+    cache: Mutex<Cache>,
     router_fqdn: String,
 }
 
 impl Resolver {
     /// Собрать резолвер. Leases читаются здесь же (отсутствие файла не фатально).
     pub fn new(config: Config) -> Self {
-        let leases = match &config.lease_file {
-            Some(path) => crate::leases::load(path),
+        let path = config.lease_file.clone();
+        let table = match &path {
+            Some(p) => leases::load(p),
             None => HashMap::new(),
         };
-        let cache = Cache::new(config.cache);
+        let last_mtime = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let leases = Mutex::new(LeaseStore {
+            path,
+            table,
+            last_reload: Instant::now(),
+            last_mtime,
+        });
+        let cache = Mutex::new(Cache::new(
+            config.cache,
+            config.cache_max_entries,
+            config.cache_ttl,
+        ));
         let router_fqdn = config.router_fqdn();
         Resolver {
             config,
@@ -65,8 +117,14 @@ impl Resolver {
         // 4. leases: hostname = имя без суффикса ".domain"
         let suffix = format!(".{}", self.config.domain);
         if let Some(host) = name.strip_suffix(&suffix) {
-            if let Some(ip) = self.leases.get(host) {
-                return Some((*ip, 60));
+            let mut store = self.leases.lock().unwrap();
+            store.maybe_reload();
+            if let Some(lease) = store.table.get(host) {
+                let now = leases::unix_now();
+                // Истёкшие аренды не резолвим (0 = бессрочно).
+                if lease.expires_at == 0 || lease.expires_at > now {
+                    return Some((lease.ip, 60));
+                }
             }
         }
         None
@@ -75,7 +133,7 @@ impl Resolver {
     /// Разрешить запрос и вернуть сырые байты ответа клиенту.
     ///
     /// `raw` — оригинальный пакет (нужен для форвардинга без потерь).
-    pub fn resolve(&mut self, query: &Query, raw: &[u8]) -> Vec<u8> {
+    pub fn resolve(&self, query: &Query, raw: &[u8]) -> Vec<u8> {
         let name = query.question.name.clone();
         let qtype = query.question.qtype;
         let qclass = query.question.qclass;
@@ -86,21 +144,21 @@ impl Resolver {
         if self.config.captive {
             if is_a_in {
                 println!("resolve: captive {} -> {}", name, self.config.captive_ip);
-                return dns::build_a_response(query, self.config.captive_ip, 60);
+                return dns::build_a_response(query, self.config.captive_ip, 60, true);
             }
             return self.forward_or_servfail(query, raw);
         }
 
-        // 2-4. локальные A-записи.
+        // 2-4. локальные A-записи (authoritative).
         if is_a_in {
             if let Some((ip, ttl)) = self.local_a(&name) {
                 println!("resolve: local {} -> {}", name, ip);
-                return dns::build_a_response(query, ip, ttl);
+                return dns::build_a_response(query, ip, ttl, true);
             }
         }
 
         // 5. cache.
-        if let Some(mut cached) = self.cache.get(&name, qtype) {
+        if let Some(mut cached) = self.cache.lock().unwrap().get(&name, qtype, qclass) {
             // Подменяем DNS-id под текущий запрос.
             let id = query.header.id.to_be_bytes();
             if cached.len() >= 2 {
@@ -111,10 +169,10 @@ impl Resolver {
             return cached;
         }
 
-        // Локальная зона без записи — NXDOMAIN, наружу не ходим.
+        // Локальная зона без записи — NXDOMAIN (authoritative), наружу не ходим.
         if is_a_in && self.is_local_zone(&name) {
             println!("resolve: NXDOMAIN {} (локальная зона, записи нет)", name);
-            return dns::build_error_response(query, dns::RCODE_NXDOMAIN);
+            return dns::build_error_response(query, dns::RCODE_NXDOMAIN, true);
         }
 
         // 6-7. форвард на upstream, иначе SERVFAIL.
@@ -122,16 +180,24 @@ impl Resolver {
     }
 
     /// Переслать запрос наружу; при успехе кэшировать, при неудаче — SERVFAIL.
-    fn forward_or_servfail(&mut self, query: &Query, raw: &[u8]) -> Vec<u8> {
+    ///
+    /// Сетевой форвард выполняется без удержания блокировок; кэш лочим только
+    /// на короткую вставку результата.
+    fn forward_or_servfail(&self, query: &Query, raw: &[u8]) -> Vec<u8> {
         match forward::forward(raw, &self.config.upstream) {
             Ok(resp) => {
-                self.cache
-                    .put(&query.question.name, query.question.qtype, resp.clone());
+                self.cache.lock().unwrap().put(
+                    &query.question.name,
+                    query.question.qtype,
+                    query.question.qclass,
+                    resp.clone(),
+                );
                 resp
             }
             Err(e) => {
                 eprintln!("resolve: SERVFAIL {}: {}", query.question.name, e);
-                dns::build_error_response(query, dns::RCODE_SERVFAIL)
+                // SERVFAIL не authoritative.
+                dns::build_error_response(query, dns::RCODE_SERVFAIL, false)
             }
         }
     }
@@ -185,32 +251,55 @@ mod tests {
         cfg
     }
 
+    /// Вставить аренду в leases-таблицу резолвера (для тестов).
+    fn insert_lease(r: &Resolver, host: &str, ip: Ipv4Addr, expires_at: u64) {
+        r.leases.lock().unwrap().table.insert(
+            host.to_string(),
+            Lease {
+                ip,
+                hostname: host.to_string(),
+                expires_at,
+            },
+        );
+    }
+
     #[test]
     fn resolve_router() {
-        let mut r = Resolver::new(base_config());
+        let r = Resolver::new(base_config());
         let resp = r.resolve(&query("router.lan", TYPE_A), &[]);
         assert_eq!(answer_ip(&resp), Ipv4Addr::new(192, 168, 4, 1));
+        // Локальный ответ — authoritative.
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & 0x0400, 0x0400);
     }
 
     #[test]
     fn resolve_static_record() {
-        let mut r = Resolver::new(base_config());
+        let r = Resolver::new(base_config());
         let resp = r.resolve(&query("admin.lan", TYPE_A), &[]);
         assert_eq!(answer_ip(&resp), Ipv4Addr::new(192, 168, 4, 5));
     }
 
     #[test]
     fn resolve_lease_hostname() {
-        let mut r = Resolver::new(base_config());
-        r.leases
-            .insert("phone".to_string(), Ipv4Addr::new(192, 168, 4, 23));
+        let r = Resolver::new(base_config());
+        insert_lease(&r, "phone", Ipv4Addr::new(192, 168, 4, 23), 0);
         let resp = r.resolve(&query("phone.lan", TYPE_A), &[]);
         assert_eq!(answer_ip(&resp), Ipv4Addr::new(192, 168, 4, 23));
     }
 
     #[test]
+    fn expired_lease_is_nxdomain() {
+        let r = Resolver::new(base_config());
+        // expires_at = 1 (в прошлом) — аренда не должна резолвиться.
+        insert_lease(&r, "ghostphone", Ipv4Addr::new(192, 168, 4, 99), 1);
+        let resp = r.resolve(&query("ghostphone.lan", TYPE_A), &[]);
+        assert_eq!(rcode(&resp), dns::RCODE_NXDOMAIN);
+    }
+
+    #[test]
     fn unknown_local_zone_is_nxdomain() {
-        let mut r = Resolver::new(base_config());
+        let r = Resolver::new(base_config());
         let resp = r.resolve(&query("ghost.lan", TYPE_A), &[]);
         assert_eq!(rcode(&resp), dns::RCODE_NXDOMAIN);
     }
@@ -220,7 +309,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.captive = true;
         cfg.captive_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let mut r = Resolver::new(cfg);
+        let r = Resolver::new(cfg);
         // Даже для произвольного внешнего домена в captive — captive_ip.
         let resp = r.resolve(&query("example.com", TYPE_A), &[]);
         assert_eq!(answer_ip(&resp), Ipv4Addr::new(10, 0, 0, 1));

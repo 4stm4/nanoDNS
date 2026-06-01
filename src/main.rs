@@ -30,6 +30,15 @@ fn main() {
     println!("nanodns: listen: {}", config.listen);
     println!("nanodns: локальная зона: {}", config.domain);
     println!("nanodns: upstream: {}", config.upstream.join(", "));
+    if config.cache {
+        println!(
+            "nanodns: cache: вкл (max_entries={}, ttl={}s)",
+            config.cache_max_entries, config.cache_ttl
+        );
+    } else {
+        println!("nanodns: cache: выкл");
+    }
+    println!("nanodns: max_inflight: {}", config.max_inflight);
     if config.captive {
         println!("nanodns: captive mode ВКЛЮЧЁН -> {}", config.captive_ip);
     }

@@ -23,6 +23,9 @@ pub struct Config {
     pub upstream: Vec<String>,
     pub lease_file: Option<String>,
     pub cache: bool,
+    pub cache_max_entries: usize,
+    pub cache_ttl: u64,
+    pub max_inflight: usize,
     pub captive: bool,
     pub captive_ip: Ipv4Addr,
     pub records: Vec<StaticRecord>,
@@ -39,11 +42,19 @@ impl Default for Config {
             upstream: vec!["1.1.1.1:53".to_string()],
             lease_file: None,
             cache: false,
+            cache_max_entries: 1024,
+            cache_ttl: 60,
+            max_inflight: 64,
             captive: false,
             captive_ip: Ipv4Addr::new(192, 168, 4, 1),
             records: Vec::new(),
         }
     }
+}
+
+/// Нормализовать доменное имя: нижний регистр и без завершающей точки.
+fn normalize_name(s: &str) -> String {
+    s.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl Config {
@@ -104,10 +115,10 @@ impl Config {
             cfg.listen = v.clone();
         }
         if let Some(v) = simple.get("domain") {
-            cfg.domain = v.to_ascii_lowercase();
+            cfg.domain = normalize_name(v);
         }
         if let Some(v) = simple.get("router_name") {
-            cfg.router_name = v.to_ascii_lowercase();
+            cfg.router_name = normalize_name(v);
         }
         if let Some(v) = simple.get("router_ip") {
             cfg.router_ip = v.parse()?;
@@ -117,6 +128,15 @@ impl Config {
         }
         if let Some(v) = simple.get("cache") {
             cfg.cache = parse_bool(v);
+        }
+        if let Some(v) = simple.get("cache_max_entries") {
+            cfg.cache_max_entries = v.parse()?;
+        }
+        if let Some(v) = simple.get("cache_ttl") {
+            cfg.cache_ttl = v.parse()?;
+        }
+        if let Some(v) = simple.get("max_inflight") {
+            cfg.max_inflight = v.parse()?;
         }
         if let Some(v) = simple.get("captive") {
             cfg.captive = parse_bool(v);
@@ -150,7 +170,7 @@ fn parse_record(value: &str) -> Result<StaticRecord, Box<dyn std::error::Error>>
     let ip: Ipv4Addr = parts[2].parse()?;
     let ttl: u32 = parts[3].parse()?;
     Ok(StaticRecord {
-        name: parts[0].to_ascii_lowercase(),
+        name: normalize_name(parts[0]),
         ip,
         ttl,
     })
@@ -167,6 +187,26 @@ mod tests {
         assert_eq!(cfg.domain, "lan");
         assert_eq!(cfg.upstream, vec!["1.1.1.1:53".to_string()]);
         assert!(!cfg.cache);
+        assert_eq!(cfg.cache_max_entries, 1024);
+        assert_eq!(cfg.cache_ttl, 60);
+        assert_eq!(cfg.max_inflight, 64);
+    }
+
+    #[test]
+    fn trailing_dot_is_normalized() {
+        let text = "domain=LAN.\nrecord=Admin.lan.,A,10.0.0.1,30\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.domain, "lan");
+        assert_eq!(cfg.records[0].name, "admin.lan");
+    }
+
+    #[test]
+    fn parse_cache_and_inflight_limits() {
+        let text = "cache_max_entries=256\ncache_ttl=120\nmax_inflight=8\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.cache_max_entries, 256);
+        assert_eq!(cfg.cache_ttl, 120);
+        assert_eq!(cfg.max_inflight, 8);
     }
 
     #[test]

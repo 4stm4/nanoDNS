@@ -19,6 +19,12 @@ lease_file=/var/lib/nanodhcp/leases.txt
 
 # Кэш ответов (true/false)
 cache=true
+# Максимум записей в кэше и TTL (секунды)
+cache_max_entries=1024
+cache_ttl=60
+
+# Лимит одновременно обрабатываемых запросов (потоков)
+max_inflight=64
 
 # Captive-режим: если true, любой A-запрос получает captive_ip
 captive=false

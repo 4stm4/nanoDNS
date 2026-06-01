@@ -1,8 +1,8 @@
 # nanoDNS
 
 [![CI](https://github.com/4stm4/nanoDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/4stm4/nanoDNS/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/badge/coverage-78.21%25-yellowgreen)](https://github.com/4stm4/nanoDNS)
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/4stm4/nanoDNS/releases)
+[![coverage](https://img.shields.io/badge/coverage-78.15%25-yellowgreen)](https://github.com/4stm4/nanoDNS)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/4stm4/nanoDNS/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![dependencies](https://img.shields.io/badge/dependencies-std%20only-success)](Cargo.toml)
 
@@ -99,6 +99,9 @@ lines are ignored. See [`config.example`](config.example).
 | `upstream`    | upstream DNS (multiple lines allowed, tried in order)             |
 | `lease_file`  | path to the DHCP lease file                                       |
 | `cache`       | `true`/`false` — enable the response cache                        |
+| `cache_max_entries` | max number of cached entries (default 1024)                 |
+| `cache_ttl`   | cache entry TTL in seconds (default 60)                           |
+| `max_inflight`| max concurrent requests / worker threads (default 64)             |
 | `captive`     | `true`/`false` — captive mode                                     |
 | `captive_ip`  | IPv4 returned in captive mode                                     |
 | `record`      | static record: `record=name,A,ip,ttl`                            |
@@ -119,6 +122,11 @@ phone.lan  -> 192.168.4.23
 laptop.lan -> 192.168.4.42
 ```
 
+The lease file is **hot-reloaded** when its mtime changes (checked at most once
+every 2 seconds), so clients that join after startup are picked up without a
+restart. `expiry` is a unix timestamp; expired leases are not resolved
+(`expiry == 0` means it never expires).
+
 If the lease file is missing or a line is malformed, the server does not crash —
 it simply skips it.
 
@@ -138,18 +146,21 @@ When `captive=true`, **every** A/IN query returns `captive_ip` (handy for a
 captive portal page). Queries that are **not A** or **not IN** are **forwarded**
 to upstream (a simple choice instead of returning NOTIMP).
 
-## Current limitations (v0.2)
+## Current limitations (v0.3)
 
 - one question per packet only;
 - only A records are served locally;
 - name compression is **not** supported in the question; upstream responses are
   proxied as-is (we do not parse their compression);
-- no TCP DNS;
+- no TCP DNS (UDP only; large answers are not split with TC);
 - no DNSSEC;
 - no DoH/DoT;
 - no local IPv6/AAAA (AAAA is forwarded upstream);
-- the cache is simple, no LRU, TTL simplified to 60 seconds;
+- the cache is simple (no LRU): bounded by `cache_max_entries`, evicting
+  arbitrary entries when full, with a fixed `cache_ttl`;
 - the config is `key=value`, not TOML/JSON.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 ## Layout
 

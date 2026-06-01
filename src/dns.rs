@@ -124,7 +124,11 @@ pub fn parse_name(buf: &[u8], mut pos: usize) -> Result<(String, usize), DnsErro
         if len & 0xC0 != 0 {
             return Err(DnsError::BadName);
         }
-        // Защита от чрезмерно длинного имени (RFC: максимум 255 байт).
+        // RFC 1035: длина одной метки не больше 63 октетов.
+        if len > 63 {
+            return Err(DnsError::BadName);
+        }
+        // RFC 1035: всё имя не длиннее 255 октетов.
         total += len + 1;
         if total > 255 {
             return Err(DnsError::BadName);
@@ -134,10 +138,27 @@ pub fn parse_name(buf: &[u8], mut pos: usize) -> Result<(String, usize), DnsErro
         let label = std::str::from_utf8(raw)
             .map_err(|_| DnsError::BadName)?
             .to_ascii_lowercase();
+        if !is_valid_label(&label) {
+            return Err(DnsError::BadName);
+        }
         labels.push(label);
         pos = end;
     }
     Ok((labels.join("."), pos))
+}
+
+/// Проверка одной метки hostname: только `a-z 0-9 - _`, без дефиса по краям.
+fn is_valid_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// Разобрать запрос целиком: заголовок и первый question.
@@ -177,16 +198,21 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
     out.push(0);
 }
 
+/// Бит AA (Authoritative Answer) в флагах DNS-заголовка.
+const FLAG_AA: u16 = 0x0400;
+
 /// Собрать ответ с одной A-записью на исходный question.
 ///
 /// `ttl` — время жизни записи в секундах.
-pub fn build_a_response(query: &Query, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+/// `authoritative` — выставить ли AA-флаг (для локальной зоны = true).
+pub fn build_a_response(query: &Query, ip: Ipv4Addr, ttl: u32, authoritative: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
 
     // Заголовок: тот же id, QR=1, RD копируем из запроса, RA=1, RCODE=0.
     out.extend_from_slice(&query.header.id.to_be_bytes());
     let rd = query.header.flags & 0x0100; // бит RD
-    let flags: u16 = 0x8000 | rd | 0x0080; // QR=1, RD, RA=1
+    let aa = if authoritative { FLAG_AA } else { 0 };
+    let flags: u16 = 0x8000 | aa | rd | 0x0080; // QR=1, [AA], RD, RA=1
     out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     out.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
@@ -210,11 +236,14 @@ pub fn build_a_response(query: &Query, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
 }
 
 /// Собрать ответ-ошибку (без answer-секции) с заданным RCODE.
-pub fn build_error_response(query: &Query, rcode: u8) -> Vec<u8> {
+///
+/// `authoritative` — выставить ли AA-флаг (для NXDOMAIN локальной зоны = true).
+pub fn build_error_response(query: &Query, rcode: u8, authoritative: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.extend_from_slice(&query.header.id.to_be_bytes());
     let rd = query.header.flags & 0x0100;
-    let flags: u16 = 0x8000 | rd | 0x0080 | (rcode as u16 & 0x0F);
+    let aa = if authoritative { FLAG_AA } else { 0 };
+    let flags: u16 = 0x8000 | aa | rd | 0x0080 | (rcode as u16 & 0x0F);
     out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
@@ -278,16 +307,35 @@ mod tests {
     }
 
     #[test]
-    fn build_a_response_layout() {
+    fn reject_too_long_label() {
+        // Метка длиной 64 (> 63) недопустима.
+        let mut buf = vec![64u8];
+        buf.extend(std::iter::repeat(b'a').take(64));
+        buf.push(0);
+        assert!(matches!(parse_name(&buf, 0), Err(DnsError::BadName)));
+    }
+
+    #[test]
+    fn reject_invalid_label_chars() {
+        let mut buf = Vec::new();
+        // метка "ab cd" с пробелом — недопустимый символ
+        buf.push(5u8);
+        buf.extend_from_slice(b"ab cd");
+        buf.push(0);
+        assert!(matches!(parse_name(&buf, 0), Err(DnsError::BadName)));
+    }
+
+    #[test]
+    fn build_a_response_layout_and_aa() {
         let raw = make_query("router.lan", TYPE_A);
         let q = parse_query(&raw).unwrap();
-        let resp = build_a_response(&q, Ipv4Addr::new(192, 168, 4, 1), 60);
+        let resp = build_a_response(&q, Ipv4Addr::new(192, 168, 4, 1), 60, true);
 
         // id сохранён
         assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0x1234);
-        // QR=1
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
-        assert_eq!(flags & 0x8000, 0x8000);
+        assert_eq!(flags & 0x8000, 0x8000); // QR=1
+        assert_eq!(flags & 0x0400, 0x0400); // AA=1 (authoritative)
         // ANCOUNT = 1
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1);
         // Последние 4 байта — IP
@@ -296,12 +344,22 @@ mod tests {
     }
 
     #[test]
+    fn non_authoritative_has_no_aa() {
+        let raw = make_query("google.com", TYPE_A);
+        let q = parse_query(&raw).unwrap();
+        let resp = build_a_response(&q, Ipv4Addr::new(1, 2, 3, 4), 60, false);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & 0x0400, 0); // AA не выставлен
+    }
+
+    #[test]
     fn build_error_has_no_answers() {
         let raw = make_query("nope.lan", TYPE_A);
         let q = parse_query(&raw).unwrap();
-        let resp = build_error_response(&q, RCODE_NXDOMAIN);
+        let resp = build_error_response(&q, RCODE_NXDOMAIN, true);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!((flags & 0x000F) as u8, RCODE_NXDOMAIN);
+        assert_eq!(flags & 0x0400, 0x0400); // AA=1
     }
 }
