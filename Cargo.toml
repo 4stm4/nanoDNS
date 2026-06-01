@@ -1,0 +1,11 @@
+[package]
+name = "nanodns"
+version = "0.1.0"
+edition = "2024"
+description = "Минимальный DNS-сервер для локальной Wi-Fi сети TinyWifi"
+
+[[bin]]
+name = "nanodns"
+path = "src/main.rs"
+
+[dependencies]

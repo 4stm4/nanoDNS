@@ -1,0 +1,29 @@
+# Пример конфигурации nanodns (формат key=value)
+
+# Адрес и порт прослушивания. Для разработки используем 5353 (порт 53 требует root).
+listen=0.0.0.0:5353
+
+# Локальная зона
+domain=lan
+
+# Имя и адрес роутера: router.lan -> router_ip
+router_name=router
+router_ip=192.168.4.1
+
+# Внешние DNS-серверы (можно указать несколько строк, опрашиваются по очереди)
+upstream=1.1.1.1:53
+upstream=8.8.8.8:53
+
+# Файл с DHCP leases от nanodhcp
+lease_file=/var/lib/nanodhcp/leases.txt
+
+# Кэш ответов (true/false)
+cache=true
+
+# Captive-режим: если true, любой A-запрос получает captive_ip
+captive=false
+captive_ip=192.168.4.1
+
+# Статические записи: record=<имя>,<тип>,<значение>,<ttl>
+record=admin.lan,A,192.168.4.1,60
+record=router.lan,A,192.168.4.1,60
