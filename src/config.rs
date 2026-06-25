@@ -13,6 +13,15 @@ pub struct StaticRecord {
     pub ttl: u32,
 }
 
+/// Что отдавать на заблокированный домен.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlockResponse {
+    /// Вернуть A-запись с заданным IP (sinkhole, например 0.0.0.0).
+    Ip(Ipv4Addr),
+    /// Вернуть NXDOMAIN.
+    NxDomain,
+}
+
 /// Полная конфигурация сервера.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +38,8 @@ pub struct Config {
     pub captive: bool,
     pub captive_ip: Ipv4Addr,
     pub records: Vec<StaticRecord>,
+    pub block_file: Option<String>,
+    pub block_response: BlockResponse,
 }
 
 impl Default for Config {
@@ -48,6 +59,8 @@ impl Default for Config {
             captive: false,
             captive_ip: Ipv4Addr::new(192, 168, 4, 1),
             records: Vec::new(),
+            block_file: None,
+            block_response: BlockResponse::Ip(Ipv4Addr::UNSPECIFIED),
         }
     }
 }
@@ -138,6 +151,16 @@ impl Config {
         if let Some(v) = simple.get("max_inflight") {
             cfg.max_inflight = v.parse()?;
         }
+        if let Some(v) = simple.get("block_file") {
+            cfg.block_file = Some(v.clone());
+        }
+        if let Some(v) = simple.get("block_response") {
+            cfg.block_response = if v.eq_ignore_ascii_case("nxdomain") {
+                BlockResponse::NxDomain
+            } else {
+                BlockResponse::Ip(v.parse()?)
+            };
+        }
         if let Some(v) = simple.get("captive") {
             cfg.captive = parse_bool(v);
         }
@@ -207,6 +230,23 @@ mod tests {
         assert_eq!(cfg.cache_max_entries, 256);
         assert_eq!(cfg.cache_ttl, 120);
         assert_eq!(cfg.max_inflight, 8);
+    }
+
+    #[test]
+    fn block_response_defaults_to_unspecified_ip() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.block_file, None);
+        assert_eq!(cfg.block_response, BlockResponse::Ip(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn parse_block_settings() {
+        let ip = Config::parse("block_file=/etc/bl\nblock_response=0.0.0.0\n").unwrap();
+        assert_eq!(ip.block_file.as_deref(), Some("/etc/bl"));
+        assert_eq!(ip.block_response, BlockResponse::Ip(Ipv4Addr::UNSPECIFIED));
+
+        let nx = Config::parse("block_response=NXDOMAIN\n").unwrap();
+        assert_eq!(nx.block_response, BlockResponse::NxDomain);
     }
 
     #[test]

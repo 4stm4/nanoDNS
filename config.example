@@ -26,6 +26,11 @@ cache_ttl=60
 # Лимит одновременно обрабатываемых запросов (потоков)
 max_inflight=64
 
+# Блокировка доменов (ad/tracking). block_file — путь к списку доменов.
+# block_response — что отдавать: IP (sinkhole, напр. 0.0.0.0) или NXDOMAIN.
+#block_file=/etc/nanodns/blocklist
+#block_response=0.0.0.0
+
 # Captive-режим: если true, любой A-запрос получает captive_ip
 captive=false
 captive_ip=192.168.4.1

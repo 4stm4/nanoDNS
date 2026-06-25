@@ -6,6 +6,7 @@
 //! Если --config не передан, используется /etc/nanodns/config.
 //! Если файла нет — применяются встроенные дефолты.
 
+mod blocklist;
 mod cache;
 mod config;
 mod dns;
@@ -14,7 +15,7 @@ mod leases;
 mod resolver;
 mod server;
 
-use config::Config;
+use config::{BlockResponse, Config};
 
 /// Путь к конфигу по умолчанию.
 const DEFAULT_CONFIG_PATH: &str = "/etc/nanodns/config";
@@ -39,6 +40,13 @@ fn main() {
         println!("nanodns: cache: выкл");
     }
     println!("nanodns: max_inflight: {}", config.max_inflight);
+    if let Some(path) = &config.block_file {
+        let what = match config.block_response {
+            BlockResponse::NxDomain => "NXDOMAIN".to_string(),
+            BlockResponse::Ip(ip) => ip.to_string(),
+        };
+        println!("nanodns: blocklist: {} -> {}", path, what);
+    }
     if config.captive {
         println!("nanodns: captive mode ВКЛЮЧЁН -> {}", config.captive_ip);
     }

@@ -21,14 +21,15 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::blocklist::{self, Blocklist};
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{BlockResponse, Config};
 use crate::dns::{self, Query};
 use crate::forward;
 use crate::leases::{self, Lease};
 
-/// Как часто разрешено проверять mtime lease-файла (не чаще, чем раз в N).
-const LEASE_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+/// Как часто разрешено проверять mtime файлов (не чаще, чем раз в N).
+const RELOAD_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Хранилище leases с метаданными для перезагрузки по mtime.
 struct LeaseStore {
@@ -44,7 +45,7 @@ impl LeaseStore {
         let Some(path) = self.path.clone() else {
             return;
         };
-        if self.last_reload.elapsed() < LEASE_RELOAD_INTERVAL {
+        if self.last_reload.elapsed() < RELOAD_INTERVAL {
             return;
         }
         self.last_reload = Instant::now();
@@ -57,10 +58,42 @@ impl LeaseStore {
     }
 }
 
-/// Состояние резолвера: конфиг, leases и кэш.
+/// Хранилище blocklist с метаданными для перезагрузки по mtime.
+struct BlockStore {
+    path: Option<String>,
+    list: Blocklist,
+    last_reload: Instant,
+    last_mtime: Option<SystemTime>,
+}
+
+impl BlockStore {
+    /// Перечитать blocklist, если прошёл интервал и mtime файла изменился.
+    fn maybe_reload(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.last_reload.elapsed() < RELOAD_INTERVAL {
+            return;
+        }
+        self.last_reload = Instant::now();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime != self.last_mtime {
+            self.list = blocklist::load(&path);
+            self.last_mtime = mtime;
+            println!(
+                "blocklist: файл изменился, перезагрузил {} ({} правил)",
+                path,
+                self.list.len()
+            );
+        }
+    }
+}
+
+/// Состояние резолвера: конфиг, leases, blocklist и кэш.
 pub struct Resolver {
     config: Config,
     leases: Mutex<LeaseStore>,
+    blocklist: Mutex<BlockStore>,
     cache: Mutex<Cache>,
     router_fqdn: String,
 }
@@ -82,6 +115,25 @@ impl Resolver {
             last_reload: Instant::now(),
             last_mtime,
         });
+
+        let block_path = config.block_file.clone();
+        let list = match &block_path {
+            Some(p) => blocklist::load(p),
+            None => Blocklist::default(),
+        };
+        if !list.is_empty() {
+            println!("blocklist: загружено {} правил", list.len());
+        }
+        let block_mtime = block_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let blocklist = Mutex::new(BlockStore {
+            path: block_path,
+            list,
+            last_reload: Instant::now(),
+            last_mtime: block_mtime,
+        });
+
         let cache = Mutex::new(Cache::new(
             config.cache,
             config.cache_max_entries,
@@ -91,9 +143,17 @@ impl Resolver {
         Resolver {
             config,
             leases,
+            blocklist,
             cache,
             router_fqdn,
         }
+    }
+
+    /// Заблокирован ли домен (с учётом возможной перезагрузки файла).
+    fn is_blocked(&self, name: &str) -> bool {
+        let mut store = self.blocklist.lock().unwrap();
+        store.maybe_reload();
+        store.list.is_blocked(name)
     }
 
     /// Является ли имя частью локальной зоны (domain или *.domain).
@@ -149,12 +209,27 @@ impl Resolver {
             return self.forward_or_servfail(query, raw);
         }
 
-        // 2-4. локальные A-записи (authoritative).
+        // 2-4. локальные A-записи (authoritative). Локальные имена приоритетнее
+        // блок-листа, чтобы случайно не заблокировать собственные сервисы.
         if is_a_in {
             if let Some((ip, ttl)) = self.local_a(&name) {
                 println!("resolve: local {} -> {}", name, ip);
                 return dns::build_a_response(query, ip, ttl, true);
             }
+        }
+
+        // Блок-лист: заблокированный домен не форвардим и не кэшируем.
+        if self.is_blocked(&name) {
+            println!("resolve: blocked {}", name);
+            return match self.config.block_response {
+                BlockResponse::NxDomain => {
+                    dns::build_error_response(query, dns::RCODE_NXDOMAIN, true)
+                }
+                BlockResponse::Ip(ip) if is_a_in => dns::build_a_response(query, ip, 60, true),
+                // Не-A запрос к заблокированному домену — отдаём NXDOMAIN,
+                // чтобы он не ушёл наружу.
+                BlockResponse::Ip(_) => dns::build_error_response(query, dns::RCODE_NXDOMAIN, true),
+            };
         }
 
         // 5. cache.
@@ -263,6 +338,11 @@ mod tests {
         );
     }
 
+    /// Заменить blocklist резолвера разобранным из текста (для тестов).
+    fn set_blocklist(r: &Resolver, text: &str) {
+        r.blocklist.lock().unwrap().list = crate::blocklist::parse(text);
+    }
+
     #[test]
     fn resolve_router() {
         let r = Resolver::new(base_config());
@@ -302,6 +382,33 @@ mod tests {
         let r = Resolver::new(base_config());
         let resp = r.resolve(&query("ghost.lan", TYPE_A), &[]);
         assert_eq!(rcode(&resp), dns::RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn blocked_domain_returns_sinkhole_ip() {
+        let r = Resolver::new(base_config()); // block_response по умолчанию = 0.0.0.0
+        set_blocklist(&r, "ads.doubleclick.net\n");
+        let resp = r.resolve(&query("ads.doubleclick.net", TYPE_A), &[]);
+        assert_eq!(answer_ip(&resp), Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn blocked_domain_can_return_nxdomain() {
+        let mut cfg = base_config();
+        cfg.block_response = crate::config::BlockResponse::NxDomain;
+        let r = Resolver::new(cfg);
+        set_blocklist(&r, "*.adserver.com\n");
+        let resp = r.resolve(&query("track.adserver.com", TYPE_A), &[]);
+        assert_eq!(rcode(&resp), dns::RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn local_record_beats_blocklist() {
+        let r = Resolver::new(base_config());
+        // admin.lan есть в static records и одновременно в блок-листе.
+        set_blocklist(&r, "admin.lan\n");
+        let resp = r.resolve(&query("admin.lan", TYPE_A), &[]);
+        assert_eq!(answer_ip(&resp), Ipv4Addr::new(192, 168, 4, 5));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # nanoDNS
 
 [![CI](https://github.com/4stm4/nanoDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/4stm4/nanoDNS/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/badge/coverage-78.15%25-yellowgreen)](https://github.com/4stm4/nanoDNS)
-[![version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/4stm4/nanoDNS/releases)
+[![coverage](https://img.shields.io/badge/coverage-79.07%25-yellowgreen)](https://github.com/4stm4/nanoDNS)
+[![version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/4stm4/nanoDNS/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![dependencies](https://img.shields.io/badge/dependencies-std%20only-success)](Cargo.toml)
 
@@ -102,6 +102,8 @@ lines are ignored. See [`config.example`](config.example).
 | `cache_max_entries` | max number of cached entries (default 1024)                 |
 | `cache_ttl`   | cache entry TTL in seconds (default 60)                           |
 | `max_inflight`| max concurrent requests / worker threads (default 64)             |
+| `block_file`  | path to a domain blocklist (ad/tracking blocking)                 |
+| `block_response` | answer for blocked domains: an IP (default `0.0.0.0`) or `NXDOMAIN` |
 | `captive`     | `true`/`false` — captive mode                                     |
 | `captive_ip`  | IPv4 returned in captive mode                                     |
 | `record`      | static record: `record=name,A,ip,ttl`                            |
@@ -130,15 +132,37 @@ restart. `expiry` is a unix timestamp; expired leases are not resolved
 If the lease file is missing or a line is malformed, the server does not crash —
 it simply skips it.
 
+## Domain blocking
+
+Set `block_file` to a list of domains to sinkhole (ads/trackers):
+
+```text
+# one domain per line, '#' comments, '*.domain' wildcards
+ads.doubleclick.net
+tracking.example.com
+*.adserver.com
+```
+
+A wildcard `*.adserver.com` blocks both `adserver.com` and any subdomain.
+Blocked names are answered with `block_response` (a sinkhole IP such as `0.0.0.0`,
+or `NXDOMAIN`) and are never forwarded or cached. Local records always win over
+the blocklist, so you cannot accidentally block your own services.
+
+The block file is **hot-reloaded** when its mtime changes (checked at most once
+every 2 seconds), so an external updater can refresh the list without a restart.
+Large lists (e.g. StevenBlack/AdGuard, ~150k domains) are kept in a hash set for
+O(1) lookups.
+
 ## Resolution order
 
 1. captive mode (if enabled);
 2. `router_name.domain`;
 3. static records from the config;
 4. leases from the lease file;
-5. cache (if enabled);
-6. forward to upstream;
-7. otherwise SERVFAIL (upstream unreachable) / NXDOMAIN (local zone, no record).
+5. blocklist (blocked → sinkhole IP / NXDOMAIN);
+6. cache (if enabled);
+7. forward to upstream;
+8. otherwise SERVFAIL (upstream unreachable) / NXDOMAIN (local zone, no record).
 
 ## Captive mode
 
@@ -176,6 +200,7 @@ nanodns/
    ├─ server.rs    # UDP loop
    ├─ resolver.rs  # answer-selection logic
    ├─ leases.rs    # DHCP lease reading
+   ├─ blocklist.rs # domain blocking (ad/tracking)
    ├─ forward.rs   # upstream forwarding
    └─ cache.rs     # simple cache
 ```

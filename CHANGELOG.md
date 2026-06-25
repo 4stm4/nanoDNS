@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+### Added
+- Domain blocking (ad/tracking sinkhole): new `block_file` option points to a
+  list of domains (one per line, `#` comments, `*.domain` wildcards). Blocked
+  names are answered with `block_response` — either a sinkhole IP (default
+  `0.0.0.0`) or `NXDOMAIN` — and are never forwarded or cached.
+- The block file is hot-reloaded by mtime (same mechanism as leases), so lists
+  updated by an external tool are picked up without a restart. Large lists
+  (StevenBlack/AdGuard, ~150k domains) are stored in a `HashSet` for O(1) lookup.
+
+### Changed
+- Resolution order: blocklist is checked after local records (so your own
+  services can never be blocked) and before cache/forwarding.
+
 ## [0.3.0]
 
 ### Added
